@@ -1,0 +1,1655 @@
+---
+title: "Spatial Determinants of Multidimensional Poverty: A Bayesian Network Approach"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: false
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+```{r package_loading, include=FALSE}
+# Load packages — discrete BN does not need rjags or coda
+# because Dirichlet posterior is closed-form analytical
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(ggplot2)
+library(corrplot)
+library(psych)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(gridExtra)
+library(igraph)
+library(ggraph)
+library(Rgraphviz)
+library(bnlearn)
+
+set.seed(42)
+
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center"
+)
+```
+
+```{r data_loading, echo=FALSE}
+# Load raw data from Excel
+df_raw <- read_excel("bayesian_selectv1.xlsx", sheet = 1)
+
+# Select 17 predictors + 1 target
+# Rename to short forms for readability
+df <- df_raw %>%
+  select(
+    MPI_perc,
+    Hhsize, Rural_perc, Female_pop, Pop_district, Landsize,
+    Num_JHS, Num_Hosp, Num_Police, Num_Bank,
+    Dist_JHS, Dist_Hospitals, Dist_Police, Dist_Banking,
+    Conc_JHS, Conc_Hosp, Conc_Police, Conc_Bank
+  ) %>%
+  na.omit() %>%
+  rename(
+    MPI  = MPI_perc,    HHS  = Hhsize,        RUR  = Rural_perc,
+    FEM  = Female_pop,  POP  = Pop_district,   LAND = Landsize,
+    NJ   = Num_JHS,     NH   = Num_Hosp,       NP   = Num_Police,
+    NB   = Num_Bank,    DJ   = Dist_JHS,       DH   = Dist_Hospitals,
+    DP   = Dist_Police, DB   = Dist_Banking,
+    CJ   = Conc_JHS,    CH   = Conc_Hosp,
+    CP   = Conc_Police, CB   = Conc_Bank
+  )
+
+# Variable reference table
+var_ref <- data.frame(
+  Short = c(
+    "MPI",
+    "HHS","RUR","FEM","POP","LAND",
+    "NJ","NH","NP","NB",
+    "DJ","DH","DP","DB",
+    "CJ","CH","CP","CB"
+  ),
+  Domain = c(
+    "Target",
+    rep("Background",    5),
+    rep("Availability",  4),
+    rep("Proximity",     4),
+    rep("Concentration", 4)
+  ),
+  Description = c(
+    "Multidimensional Poverty Index (%)",
+    "Average household size",
+    "Rural population share (%)",
+    "Female population count",
+    "Total district population",
+    "District land area (km2)",
+    "Number of junior high schools",
+    "Number of hospitals",
+    "Number of police stations",
+    "Number of banks",
+    "Mean distance to nearest JHS (km)",
+    "Mean distance to nearest hospital (km)",
+    "Mean distance to nearest police station (km)",
+    "Mean distance to nearest bank (km)",
+    "Concentration of JHS per population/area",
+    "Concentration of hospitals per population/area",
+    "Concentration of police stations per population/area",
+    "Concentration of banks per population/area"
+  ),
+  stringsAsFactors = FALSE
+)
+
+cat("Observations:", nrow(df), "\n")
+cat("Variables   :", ncol(df), "\n")
+cat("Any NA      :", anyNA(df), "\n")
+```
+
+```{r variable_reference, echo=FALSE}
+kable(
+  var_ref,
+  caption   = "Table 1: Variable Definitions and Short Form Reference",
+  col.names = c("Short Form", "Domain", "Description")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 13,
+    full_width        = FALSE
+  ) %>%
+  row_spec(1,    bold = TRUE, background = "#FCEBEB") %>%
+  row_spec(2:6,  background  = "#FAEEDA") %>%
+  row_spec(7:10, background  = "#E1F5EE") %>%
+  row_spec(11:14,background  = "#EEEDFE") %>%
+  row_spec(15:18,background  = "#FAECE7")
+```
+
+```{r discretization, echo=FALSE}
+# Convert all 18 continuous variables to 3-level categorical factors
+# Using tertile-based equal-frequency binning
+# Handles tied values by jittering when cutpoints collapse
+
+discretize_tertile <- function(x, var_name = ""){
+  
+  cutpoints <- quantile(x, probs = c(0, 0.333, 0.667, 1),
+                        na.rm = TRUE)
+  
+  # Check for non-unique cutpoints (caused by ties in the data)
+  if(length(unique(cutpoints)) < 4){
+    
+    cat("WARNING: Non-unique cutpoints in",
+        var_name, "— applying jittered tertile\n")
+    
+    # Add tiny random noise to break ties
+    # Magnitude: 0.0001 of the variable's standard deviation
+    jitter_amount <- sd(x, na.rm = TRUE) * 0.0001
+    x_jittered    <- x + runif(length(x),
+                                -jitter_amount,
+                                 jitter_amount)
+    
+    cutpoints <- quantile(x_jittered,
+                          probs = c(0, 0.333, 0.667, 1),
+                          na.rm = TRUE)
+    x <- x_jittered
+  }
+  
+  factor_x <- cut(
+    x,
+    breaks         = cutpoints,
+    labels         = c("Low","Medium","High"),
+    include.lowest = TRUE,
+    ordered_result = TRUE
+  )
+  
+  return(factor_x)
+}
+
+# Apply discretization with variable name passed through for warnings
+df_disc <- df
+for(v in names(df_disc)){
+  df_disc[[v]] <- discretize_tertile(df_disc[[v]], var_name = v)
+}
+
+df_disc <- as.data.frame(df_disc)
+
+cat("\nDiscretization complete\n")
+cat("All factors :", all(sapply(df_disc, is.factor)), "\n")
+cat("All 3 levels:",
+    all(sapply(df_disc, nlevels) == 3), "\n")
+cat("Observations:", nrow(df_disc), "\n")
+```
+
+```{r category_distribution, echo=FALSE}
+# Show the count of districts in each category for each variable
+# Should be roughly equal (~87 per category for tertiles)
+
+dist_table <- sapply(df_disc, table) %>%
+  t() %>%
+  as.data.frame()
+
+dist_table$Variable <- rownames(dist_table)
+dist_table <- dist_table %>%
+  select(Variable, Low, Medium, High) %>%
+  mutate(
+    Total = Low + Medium + High,
+    Balance = round(min(c(Low, Medium, High)) /
+                     max(c(Low, Medium, High)), 2)
+  )
+
+# Compute balance per row
+dist_table$Balance <- apply(dist_table[, c("Low","Medium","High")],
+                             1,
+                             function(x) round(min(x) / max(x), 2))
+
+kable(
+  dist_table,
+  caption   = "Table 2: Tertile Category Distribution by Variable",
+  col.names = c("Variable","Low","Medium","High","Total","Balance"),
+  align     = c("l","r","r","r","r","r")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = FALSE
+  ) %>%
+  row_spec(
+    which(dist_table$Balance < 0.7),
+    background = "#FCEBEB"
+  )
+
+cat("\nBalance values close to 1.0 indicate equal frequency across categories.\n")
+cat("Values below 0.7 (highlighted red) suggest imbalanced bins,\n")
+cat("which can occur when many districts share identical values.\n")
+```
+
+```{r cutpoints_table, echo=FALSE}
+# Document the actual cutpoints used for each variable
+# This goes in the methodology section of the paper
+
+cutpoints_list <- lapply(names(df), function(v){
+  cp <- quantile(df[[v]],
+                  probs = c(0, 0.333, 0.667, 1),
+                  na.rm = TRUE)
+  data.frame(
+    Variable = v,
+    Min      = round(cp[1], 3),
+    Cut_33   = round(cp[2], 3),
+    Cut_67   = round(cp[3], 3),
+    Max      = round(cp[4], 3)
+  )
+})
+
+cutpoints_df <- bind_rows(cutpoints_list)
+
+kable(
+  cutpoints_df,
+  caption   = "Table 3: Tertile Cutpoints for Each Variable",
+  col.names = c("Variable","Minimum","33rd Percentile",
+                "67th Percentile","Maximum")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = FALSE
+  )
+```
+
+```{r descriptive_statistics, echo=FALSE}
+# Descriptive statistics combining raw variable stats
+# with discretized tertile proportions
+# Matches the format: Short Form | Description | Mean | SD |
+#                     Tertile 1 | Tertile 2 | Tertile 3
+
+# Raw variable statistics from original continuous data
+raw_stats <- data.frame(
+  Short = names(df),
+  Mean  = round(sapply(df, mean, na.rm = TRUE), 3),
+  SD    = round(sapply(df, sd,   na.rm = TRUE), 3)
+)
+
+# Discretized proportions from df_disc
+# Tertile 1 = Low, Tertile 2 = Medium, Tertile 3 = High
+disc_props <- data.frame(
+  Short     = names(df_disc),
+  Tertile_1 = round(sapply(df_disc,
+    function(x) sum(x == "Low",    na.rm = TRUE) / length(x)), 3),
+  Tertile_2 = round(sapply(df_disc,
+    function(x) sum(x == "Medium", na.rm = TRUE) / length(x)), 3),
+  Tertile_3 = round(sapply(df_disc,
+    function(x) sum(x == "High",   na.rm = TRUE) / length(x)), 3)
+)
+
+# Merge with variable reference for descriptions
+desc_table <- var_ref %>%
+  left_join(raw_stats,  by = "Short") %>%
+  left_join(disc_props, by = "Short") %>%
+  select(Short, Description, Mean, SD,
+         Tertile_1, Tertile_2, Tertile_3)
+
+# Display with merged header spanning Raw Variables and
+# Discretized Proportion — achieved via add_header_above
+kable(
+  desc_table,
+  caption   = "Table 2: Descriptive Statistics and Tertile Distributions (n = 261 Districts)",
+  col.names = c("Short Form","Description",
+                "Mean","SD",
+                "Tertile 1","Tertile 2","Tertile 3"),
+  digits    = 3,
+  align     = c("l","l","r","r","r","r","r")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = TRUE
+  ) %>%
+  add_header_above(
+    c(" " = 2,
+      "Raw Variables" = 2,
+      "Discretized Proportion" = 3)
+  ) %>%
+  row_spec(1,   bold = TRUE, background = "#FCEBEB") %>%
+  row_spec(2:6,  background = "#FAEEDA") %>%
+  row_spec(7:10, background = "#E1F5EE") %>%
+  row_spec(11:14,background = "#EEEDFE") %>%
+  row_spec(15:18,background = "#FAECE7")
+```
+
+```{r bn_data_prep, echo=FALSE}
+# bnlearn requires a clean data.frame of factors
+bn_data_disc <- as.data.frame(df_disc)
+
+# Verify all columns are ordered factors with 3 levels
+stopifnot(all(sapply(bn_data_disc, is.factor)))
+stopifnot(all(sapply(bn_data_disc, nlevels) == 3))
+
+# Define variable groups by domain
+bg_vars   <- c("HHS","RUR","FEM","POP","LAND")
+av_vars   <- c("NJ","NH","NP","NB")
+prox_vars <- c("DJ","DH","DP","DB")
+conc_vars <- c("CJ","CH","CP","CB")
+target    <- "MPI"
+all_vars  <- names(bn_data_disc)
+
+cat("Discrete BN data ready\n")
+cat("Observations:", nrow(bn_data_disc), "\n")
+cat("Variables   :", ncol(bn_data_disc), "\n")
+cat("Each variable has 3 levels: Low, Medium, High\n")
+```
+
+```{r blacklists, echo=FALSE}
+# Two blacklist versions for parallel analysis
+# Version A: same theoretical constraints as continuous BN
+# Version B: minimal — only MPI is forced terminal
+
+# === VERSION A — CONSTRAINED ===
+# Rule 1: MPI cannot cause any predictor (terminal target)
+bl_A1 <- data.frame(
+  from = target,
+  to   = setdiff(all_vars, target)
+)
+
+# Rule 2: Background variables are root nodes
+bl_A2 <- expand.grid(
+  from = setdiff(all_vars, bg_vars),
+  to   = bg_vars,
+  stringsAsFactors = FALSE
+)
+
+# Rule 3: Concentration cannot reverse-cause availability
+bl_A3 <- data.frame(
+  from = c("CB","CH","CP","CJ"),
+  to   = c("NB","NH","NP","NJ")
+)
+
+blacklist_A <- bind_rows(bl_A1, bl_A2, bl_A3) %>%
+  distinct(from, to)
+
+# === VERSION B — UNCONSTRAINED ===
+# Only Rule 1 — MPI is terminal
+blacklist_B <- bl_A1
+
+cat("Constrained blacklist (Version A) :",
+    nrow(blacklist_A), "arcs\n")
+cat("Unconstrained blacklist (Version B):",
+    nrow(blacklist_B), "arcs\n")
+```
+
+```{r structure_learning, echo=FALSE, cache=TRUE}
+# For each blacklist version run three algorithms
+# HC-BDe — Hill Climbing with Bayesian Dirichlet equivalent score
+# MMHC   — hybrid score+constraint based
+# PC     — constraint-based
+# All use BDe as score where applicable
+# 
+# BDe is the discrete analog of BGe with Dirichlet priors
+
+# === VERSION A: CONSTRAINED ===
+hc_A <- hc(
+  bn_data_disc,
+  score     = "bde",
+  iss       = 1,
+  blacklist = blacklist_A
+)
+
+mmhc_A <- mmhc(
+  bn_data_disc,
+  blacklist = blacklist_A
+)
+
+pc_A <- pc.stable(
+  bn_data_disc,
+  alpha     = 0.05,
+  blacklist = blacklist_A
+)
+
+cat("=== VERSION A (Constrained) ===\n")
+cat("HC arcs  :", nrow(arcs(hc_A)),  "\n")
+cat("MMHC arcs:", nrow(arcs(mmhc_A)),"\n")
+cat("PC arcs  :", nrow(arcs(pc_A)),  "\n")
+
+# === VERSION B: UNCONSTRAINED ===
+hc_B <- hc(
+  bn_data_disc,
+  score     = "bde",
+  iss       = 1,
+  blacklist = blacklist_B
+)
+
+mmhc_B <- mmhc(
+  bn_data_disc,
+  blacklist = blacklist_B
+)
+
+pc_B <- pc.stable(
+  bn_data_disc,
+  alpha     = 0.05,
+  blacklist = blacklist_B
+)
+
+cat("\n=== VERSION B (Unconstrained) ===\n")
+cat("HC arcs  :", nrow(arcs(hc_B)),  "\n")
+cat("MMHC arcs:", nrow(arcs(mmhc_B)),"\n")
+cat("PC arcs  :", nrow(arcs(pc_B)),  "\n")
+```
+
+```{r bootstrap_both, echo=FALSE}
+# Bootstrap arc strength for each blacklist version
+# 500 iterations balances precision and computation
+# Saves to disk for instant loading on subsequent knits
+
+if(file.exists("boot_disc_A.rds") &
+   file.exists("boot_disc_B.rds")){
+  
+  cat("Loading cached bootstrap results...\n")
+  boot_disc_A_hc   <- readRDS("boot_disc_A.rds")$hc
+  boot_disc_A_mmhc <- readRDS("boot_disc_A.rds")$mmhc
+  boot_disc_A_pc   <- readRDS("boot_disc_A.rds")$pc
+  boot_disc_B_hc   <- readRDS("boot_disc_B.rds")$hc
+  boot_disc_B_mmhc <- readRDS("boot_disc_B.rds")$mmhc
+  boot_disc_B_pc   <- readRDS("boot_disc_B.rds")$pc
+  
+} else {
+  
+  # === VERSION A bootstraps ===
+  cat("Running Version A — HC bootstrap (500)...\n")
+  boot_disc_A_hc <- boot.strength(
+    data           = bn_data_disc,
+    R              = 500,
+    algorithm      = "hc",
+    algorithm.args = list(score = "bde",
+                           iss   = 1,
+                           blacklist = blacklist_A)
+  )
+  
+  cat("Running Version A — MMHC bootstrap (500)...\n")
+  boot_disc_A_mmhc <- boot.strength(
+    data           = bn_data_disc,
+    R              = 500,
+    algorithm      = "mmhc",
+    algorithm.args = list(blacklist = blacklist_A)
+  )
+  
+  cat("Running Version A — PC bootstrap (500)...\n")
+  boot_disc_A_pc <- boot.strength(
+    data           = bn_data_disc,
+    R              = 500,
+    algorithm      = "pc.stable",
+    algorithm.args = list(alpha = 0.05,
+                           blacklist = blacklist_A)
+  )
+  
+  saveRDS(list(hc   = boot_disc_A_hc,
+                mmhc = boot_disc_A_mmhc,
+                pc   = boot_disc_A_pc),
+          "boot_disc_A.rds")
+  
+  # === VERSION B bootstraps ===
+  cat("Running Version B — HC bootstrap (500)...\n")
+  boot_disc_B_hc <- boot.strength(
+    data           = bn_data_disc,
+    R              = 500,
+    algorithm      = "hc",
+    algorithm.args = list(score = "bde",
+                           iss   = 1,
+                           blacklist = blacklist_B)
+  )
+  
+  cat("Running Version B — MMHC bootstrap (500)...\n")
+  boot_disc_B_mmhc <- boot.strength(
+    data           = bn_data_disc,
+    R              = 500,
+    algorithm      = "mmhc",
+    algorithm.args = list(blacklist = blacklist_B)
+  )
+  
+  cat("Running Version B — PC bootstrap (500)...\n")
+  boot_disc_B_pc <- boot.strength(
+    data           = bn_data_disc,
+    R              = 500,
+    algorithm      = "pc.stable",
+    algorithm.args = list(alpha = 0.05,
+                           blacklist = blacklist_B)
+  )
+  
+  saveRDS(list(hc   = boot_disc_B_hc,
+                mmhc = boot_disc_B_mmhc,
+                pc   = boot_disc_B_pc),
+          "boot_disc_B.rds")
+  
+  cat("\nAll bootstraps complete and saved\n")
+}
+```
+
+```{r consensus_dags_both, echo=FALSE}
+# Build consensus DAG for each version
+# Use threshold 0.50 to match the continuous BN primary model
+
+build_consensus <- function(boot_hc, boot_mmhc, boot_pc,
+                              threshold = 0.50){
+  
+  merged <- boot_hc %>%
+    rename(str_hc = strength, dir_hc = direction) %>%
+    full_join(
+      boot_mmhc %>% rename(str_mmhc = strength,
+                           dir_mmhc = direction),
+      by = c("from","to")
+    ) %>%
+    full_join(
+      boot_pc %>% rename(str_pc = strength,
+                         dir_pc = direction),
+      by = c("from","to")
+    ) %>%
+    mutate(
+      across(starts_with("str_"), ~ replace_na(., 0)),
+      mean_strength = (str_hc + str_mmhc + str_pc) / 3,
+      mean_direction = (replace_na(dir_hc,   0) +
+                        replace_na(dir_mmhc, 0) +
+                        replace_na(dir_pc,   0)) / 3
+    ) %>%
+    filter(mean_strength >= threshold,
+           mean_direction >= 0.50) %>%
+    arrange(desc(mean_strength))
+  
+  return(merged)
+}
+
+# Build for both versions
+cons_A_arcs <- build_consensus(boot_disc_A_hc,
+                                 boot_disc_A_mmhc,
+                                 boot_disc_A_pc,
+                                 threshold = 0.50)
+
+cons_B_arcs <- build_consensus(boot_disc_B_hc,
+                                 boot_disc_B_mmhc,
+                                 boot_disc_B_pc,
+                                 threshold = 0.50)
+
+# Construct DAG objects
+consensus_A <- empty.graph(nodes = all_vars)
+arcs(consensus_A) <- as.matrix(cons_A_arcs[, c("from","to")])
+
+consensus_B <- empty.graph(nodes = all_vars)
+arcs(consensus_B) <- as.matrix(cons_B_arcs[, c("from","to")])
+
+cat("=== CONSENSUS DAG (Version A — Constrained) ===\n")
+cat("Total arcs            :", nrow(arcs(consensus_A)), "\n")
+cat("Direct parents of MPI :",
+    paste(parents(consensus_A, "MPI"), collapse = ", "), "\n")
+
+cat("\n=== CONSENSUS DAG (Version B — Unconstrained) ===\n")
+cat("Total arcs            :", nrow(arcs(consensus_B)), "\n")
+cat("Direct parents of MPI :",
+    paste(parents(consensus_B, "MPI"), collapse = ", "), "\n")
+```
+
+```{r visualize_both_dags, echo=FALSE, fig.width=14, fig.height=8}
+# Plot both consensus DAGs for visual comparison
+# Domain colour coding maintained from continuous BN
+
+plot_dag <- function(dag, title){
+  
+  g <- as.graphNEL(dag)
+  
+  fill_colours <- rep("#FFFFFF", length(nodes(dag)))
+  names(fill_colours) <- nodes(dag)
+  fill_colours[target]    <- "#FCEBEB"
+  fill_colours[bg_vars]   <- "#FAEEDA"
+  fill_colours[av_vars]   <- "#E1F5EE"
+  fill_colours[prox_vars] <- "#EEEDFE"
+  fill_colours[conc_vars] <- "#FAECE7"
+  
+  nAttrs           <- list()
+  nAttrs$fillcolor <- fill_colours
+  
+  plot(g,
+       attrs = list(
+         node  = list(shape = "rectangle", fontsize = 10,
+                      width = 1.2, height = 0.5),
+         edge  = list(arrowsize = 0.7),
+         graph = list(rankdir = "BT")
+       ),
+       nodeAttrs = nAttrs,
+       main      = title)
+}
+
+par(mfrow = c(1, 2), mar = c(1, 1, 3, 1))
+
+plot_dag(consensus_A,
+         "Version A: Constrained (Theory-Informed)")
+
+plot_dag(consensus_B,
+         "Version B: Unconstrained (Data-Driven)")
+
+par(mfrow = c(1, 1))
+
+# Legend
+plot.new()
+legend("center",
+       legend = c("MPI (Target)","Background",
+                  "Availability","Proximity","Concentration"),
+       fill   = c("#FCEBEB","#FAEEDA",
+                  "#E1F5EE","#EEEDFE","#FAECE7"),
+       border = "gray40", bty = "n", cex = 1.0,
+       title  = "Node Domain")
+```
+
+```{r bde_comparison, echo=FALSE}
+# Compare BDe scores across all candidate models
+# Higher BDe = better fit
+# cextend forces full orientation before scoring
+
+# Force directed orientations
+hc_A_d   <- cextend(hc_A)
+mmhc_A_d <- cextend(mmhc_A)
+pc_A_d   <- cextend(pc_A)
+cons_A_d <- cextend(consensus_A)
+
+hc_B_d   <- cextend(hc_B)
+mmhc_B_d <- cextend(mmhc_B)
+pc_B_d   <- cextend(pc_B)
+cons_B_d <- cextend(consensus_B)
+
+bde_scores <- data.frame(
+  Version = c(rep("A (Constrained)", 4),
+              rep("B (Unconstrained)", 4)),
+  Model = c(
+    "Hill Climbing (BDe)",
+    "MMHC",
+    "PC-Stable",
+    "Consensus DAG (0.50)",
+    "Hill Climbing (BDe)",
+    "MMHC",
+    "PC-Stable",
+    "Consensus DAG (0.50)"
+  ),
+  BDe_Score = round(c(
+    score(hc_A_d,   bn_data_disc, type = "bde", iss = 1),
+    score(mmhc_A_d, bn_data_disc, type = "bde", iss = 1),
+    score(pc_A_d,   bn_data_disc, type = "bde", iss = 1),
+    score(cons_A_d, bn_data_disc, type = "bde", iss = 1),
+    score(hc_B_d,   bn_data_disc, type = "bde", iss = 1),
+    score(mmhc_B_d, bn_data_disc, type = "bde", iss = 1),
+    score(pc_B_d,   bn_data_disc, type = "bde", iss = 1),
+    score(cons_B_d, bn_data_disc, type = "bde", iss = 1)
+  ), 3),
+  N_Arcs = c(
+    nrow(arcs(hc_A_d)),   nrow(arcs(mmhc_A_d)),
+    nrow(arcs(pc_A_d)),   nrow(arcs(cons_A_d)),
+    nrow(arcs(hc_B_d)),   nrow(arcs(mmhc_B_d)),
+    nrow(arcs(pc_B_d)),   nrow(arcs(cons_B_d))
+  )
+)
+
+bde_scores$Best <- ifelse(
+  bde_scores$BDe_Score == max(bde_scores$BDe_Score),
+  "Yes", ""
+)
+
+kable(
+  bde_scores,
+  caption   = "Table 4: BDe Score Comparison Across All Models",
+  col.names = c("Version","Model","BDe Score","No. Arcs","Best Fit")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = FALSE
+  ) %>%
+  row_spec(
+    which(bde_scores$Best == "Yes"),
+    bold       = TRUE,
+    background = "#E1F5EE"
+  )
+```
+
+```{r model_designation, echo=FALSE}
+# Designate Version A (Constrained) as the primary discrete BN
+# Version B (Unconstrained) becomes the robustness check
+
+primary_dag_disc        <- consensus_A
+sensitivity_dag_disc    <- consensus_B
+
+primary_parents_disc    <- parents(primary_dag_disc, "MPI")
+sensitivity_parents_disc <- parents(sensitivity_dag_disc, "MPI")
+
+cat("=== PRIMARY MODEL ===\n")
+cat("DAG: Version A (Constrained)\n")
+cat("Total arcs            :", nrow(arcs(primary_dag_disc)), "\n")
+cat("Direct parents of MPI :",
+    paste(primary_parents_disc, collapse = ", "), "\n")
+
+cat("\n=== ROBUSTNESS CHECK ===\n")
+cat("DAG: Version B (Unconstrained)\n")
+cat("Total arcs            :", nrow(arcs(sensitivity_dag_disc)), "\n")
+cat("Direct parents of MPI :",
+    paste(sensitivity_parents_disc, collapse = ", "), "\n")
+```
+
+```{r bayesian_parameter_estimation, echo=FALSE}
+# Force full DAG orientation before parameter estimation
+# cextend() resolves any partially directed arcs using
+# the Dor & Tarsi (1992) extension algorithm
+
+primary_dag_disc_d <- cextend(primary_dag_disc)
+
+cat("Primary DAG arcs before extend:",
+    nrow(arcs(primary_dag_disc)), "\n")
+cat("Primary DAG arcs after extend :",
+    nrow(arcs(primary_dag_disc_d)), "\n")
+
+# Update primary parents — orientation may have changed
+primary_parents_disc <- parents(primary_dag_disc_d, "MPI")
+cat("Direct parents of MPI:",
+    paste(primary_parents_disc, collapse = ", "), "\n\n")
+
+# Bayesian parameter estimation with weak prior
+# iss = 1 — data dominates the posterior
+bn_fit_weak <- bn.fit(
+  primary_dag_disc_d,
+  data   = bn_data_disc,
+  method = "bayes",
+  iss    = 1
+)
+
+# Bayesian parameter estimation with strong prior
+# iss = 10 — moderate regularisation
+bn_fit_strong <- bn.fit(
+  primary_dag_disc_d,
+  data   = bn_data_disc,
+  method = "bayes",
+  iss    = 10
+)
+
+cat("Bayesian parameter estimation complete\n")
+cat("Method: Closed-form Dirichlet-Multinomial conjugate update\n")
+cat("Weak prior   : iss = 1\n")
+cat("Strong prior : iss = 10\n")
+cat("Nodes fitted :", length(nodes(primary_dag_disc_d)), "\n")
+```
+
+```{r mpi_cpt_display, echo=FALSE}
+# Display the CPT for MPI under both priors
+# This is the core output for policy interpretation
+
+# Extract MPI CPT
+cpt_mpi_weak   <- bn_fit_weak$MPI$prob
+cpt_mpi_strong <- bn_fit_strong$MPI$prob
+
+cat("Direct parents of MPI:", 
+    paste(primary_parents_disc, collapse = ", "), "\n\n")
+
+cat("=== Conditional Probability Table for MPI ===\n")
+cat("=== Weak Prior (iss = 1) ===\n")
+print(round(cpt_mpi_weak, 3))
+
+cat("\n=== Strong Prior (iss = 10) ===\n")
+print(round(cpt_mpi_strong, 3))
+
+# Convert to readable format for table display
+cpt_to_df <- function(cpt, prior_label){
+  cpt_flat <- as.data.frame.table(cpt)
+  
+  # Rename for readability
+  parent_cols <- setdiff(names(cpt_flat), c("MPI","Freq"))
+  
+  result <- cpt_flat %>%
+    rename(Probability = Freq, MPI_State = MPI) %>%
+    mutate(Probability = round(Probability, 3),
+           Prior       = prior_label)
+  
+  return(result)
+}
+
+cpt_weak_df   <- cpt_to_df(cpt_mpi_weak,   "Weak (iss=1)")
+cpt_strong_df <- cpt_to_df(cpt_mpi_strong, "Strong (iss=10)")
+
+# Display weak prior table
+kable(
+  cpt_weak_df,
+  caption = paste0("Table 5: MPI Conditional Probability Table — Weak Prior")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 11,
+    full_width        = FALSE
+  )
+```
+
+
+```{r cpt_heatmap, echo=FALSE, fig.width=12, fig.height=6}
+# Visualise MPI CPT as heatmap
+# Each row is a parent state combination
+# Each column is an MPI state (Low/Medium/High)
+# Cell colour shows probability
+
+# Reshape CPT for plotting
+plot_cpt_heatmap <- function(cpt_df, title){
+  
+  parent_cols <- setdiff(names(cpt_df),
+                          c("MPI_State","Probability","Prior"))
+  
+  # Create combined parent label
+  cpt_df$ParentCombo <- apply(
+    cpt_df[, parent_cols, drop = FALSE], 1,
+    function(x) paste(parent_cols, x, sep = "=", collapse = " | ")
+  )
+  
+  ggplot(cpt_df,
+         aes(x = MPI_State, y = ParentCombo, fill = Probability)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.2f", Probability)),
+              size = 3.2) +
+    scale_fill_gradient(
+      low  = "#F7F4ED",
+      high = "#185FA5",
+      limits = c(0, 1)
+    ) +
+    labs(
+      title = title,
+      x     = "MPI State",
+      y     = "Parent Configuration"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 12),
+      axis.text.y      = element_text(size = 8),
+      panel.grid       = element_blank()
+    )
+}
+
+p1 <- plot_cpt_heatmap(cpt_weak_df,
+                        "Figure 1: MPI CPT — Weak Prior (iss = 1)")
+p2 <- plot_cpt_heatmap(cpt_strong_df,
+                        "Figure 2: MPI CPT — Strong Prior (iss = 10)")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r cpt_sensitivity, echo=FALSE}
+# Compare CPT entries under weak vs strong priors
+# Convergence: |Diff| < 0.05 means data dominates
+# Divergence: |Diff| >= 0.05 means prior matters
+
+# Combine both CPTs
+cpt_compare <- cpt_weak_df %>%
+  rename(Prob_Weak = Probability) %>%
+  select(-Prior) %>%
+  left_join(
+    cpt_strong_df %>%
+      rename(Prob_Strong = Probability) %>%
+      select(-Prior),
+    by = c(setdiff(names(cpt_weak_df), c("Probability","Prior")))
+  ) %>%
+  mutate(
+    AbsDiff = round(abs(Prob_Weak - Prob_Strong), 4),
+    Verdict = ifelse(AbsDiff < 0.05, "Converge", "Diverge")
+  )
+
+# Summary statistics
+n_total    <- nrow(cpt_compare)
+n_converge <- sum(cpt_compare$Verdict == "Converge")
+n_diverge  <- sum(cpt_compare$Verdict == "Diverge")
+mean_diff  <- round(mean(cpt_compare$AbsDiff), 4)
+max_diff   <- round(max(cpt_compare$AbsDiff),  4)
+
+cat("=== CPT Prior Sensitivity Summary ===\n")
+cat("Total CPT entries           :", n_total,    "\n")
+cat("Converge (Diff < 0.05)      :", n_converge, "\n")
+cat("Diverge  (Diff >= 0.05)     :", n_diverge,  "\n")
+cat("Mean absolute difference    :", mean_diff,  "\n")
+cat("Max absolute difference     :", max_diff,   "\n")
+
+kable(
+  cpt_compare,
+  caption   = "Table 6: MPI CPT Prior Sensitivity Comparison"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 11,
+    full_width        = FALSE
+  ) %>%
+  row_spec(
+    which(cpt_compare$Verdict == "Diverge"),
+    background = "#FCEBEB"
+  ) %>%
+  row_spec(
+    which(cpt_compare$Verdict == "Converge"),
+    background = "#E1F5EE"
+  )
+```
+
+```{r query_helper, echo=FALSE}
+# Generic function to compute P(MPI = state | evidence)
+# Uses likelihood weighting via cpquery for discrete BN
+# 
+# bnlearn requires evidence as an unquoted expression evaluated
+# in its own scope — we use str2lang and pass via list
+# This is the correct pattern documented in bnlearn vignettes
+
+query_mpi <- function(bn, evidence_string, n_sim = 50000){
+  
+  # Convert string to language object
+  ev_expr <- str2lang(evidence_string)
+  
+  # cpquery uses non-standard evaluation — we must construct
+  # the call manually with the evidence expression substituted
+  
+  p_low <- eval(bquote(
+    cpquery(.(bn),
+            event    = (MPI == "Low"),
+            evidence = .(ev_expr),
+            n        = .(n_sim))
+  ))
+  
+  p_med <- eval(bquote(
+    cpquery(.(bn),
+            event    = (MPI == "Medium"),
+            evidence = .(ev_expr),
+            n        = .(n_sim))
+  ))
+  
+  p_high <- eval(bquote(
+    cpquery(.(bn),
+            event    = (MPI == "High"),
+            evidence = .(ev_expr),
+            n        = .(n_sim))
+  ))
+  
+  return(data.frame(
+    P_Low    = round(p_low,  4),
+    P_Medium = round(p_med,  4),
+    P_High   = round(p_high, 4)
+  ))
+}
+
+# Test the function
+test_result <- query_mpi(bn_fit_weak, "(HHS == 'High')")
+cat("Test query: P(MPI | HHS = High)\n")
+print(test_result)
+```
+
+```{r single_var_effects, echo=FALSE}
+# For each variable compute P(MPI = state | variable = level)
+# Three rows per variable: Low, Medium, High
+# Comparing across rows shows the variable's effect on MPI
+
+# Only include variables that appear in the primary DAG
+vars_in_dag <- nodes(primary_dag_disc_d)
+vars_in_dag <- setdiff(vars_in_dag, "MPI")
+
+effects_list <- list()
+
+set.seed(42)
+
+for(v in vars_in_dag){
+  for(state in c("Low","Medium","High")){
+    
+    evidence_str <- sprintf("(%s == '%s')", v, state)
+    
+    probs <- tryCatch(
+      query_mpi(bn_fit_weak, evidence_str, n_sim = 30000),
+      error = function(e) data.frame(P_Low = NA,
+                                      P_Medium = NA,
+                                      P_High = NA)
+    )
+    
+    effects_list[[length(effects_list) + 1]] <- data.frame(
+      Variable = v,
+      State    = state,
+      probs
+    )
+  }
+}
+
+single_effects <- bind_rows(effects_list)
+
+# Compute change in P(MPI = High) from Low to High state
+# This is the simplest measure of total effect
+shift_summary <- single_effects %>%
+  pivot_wider(
+    names_from  = State,
+    values_from = c(P_Low, P_Medium, P_High),
+    names_glue  = "{.value}_{State}"
+  ) %>%
+  mutate(
+    Shift_PHigh   = round(P_High_High - P_High_Low,    4),
+    Shift_PLow    = round(P_Low_High  - P_Low_Low,     4),
+    Effect_Direction = case_when(
+      Shift_PHigh > 0.10  ~ "Strong increases poverty",
+      Shift_PHigh > 0.05  ~ "Moderate increases poverty",
+      Shift_PHigh < -0.10 ~ "Strong reduces poverty",
+      Shift_PHigh < -0.05 ~ "Moderate reduces poverty",
+      TRUE                ~ "Negligible / no effect"
+    )
+  ) %>%
+  select(Variable, P_High_Low, P_High_High,
+         Shift_PHigh, Effect_Direction) %>%
+  arrange(desc(abs(Shift_PHigh)))
+
+kable(
+  shift_summary,
+  caption   = "Table 7: Counterfactual Total Effect on P(MPI = High)",
+  col.names = c("Variable",
+                "P(MPI=High | Var=Low)",
+                "P(MPI=High | Var=High)",
+                "Probability Shift",
+                "Effect Direction")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = FALSE
+  ) %>%
+  row_spec(
+    which(shift_summary$Effect_Direction == "Strong increases poverty"),
+    bold = TRUE, background = "#FCEBEB"
+  ) %>%
+  row_spec(
+    which(shift_summary$Effect_Direction == "Strong reduces poverty"),
+    bold = TRUE, background = "#E1F5EE"
+  )
+```
+
+```{r effect_classification, echo=FALSE}
+# Classify each variable's effect on MPI as Direct, Indirect, or None
+# Direct  — variable is a parent of MPI
+# Indirect — variable has at least one path to MPI but not direct
+# None — no path to MPI in the DAG
+
+# Find paths from each variable to MPI
+find_paths_to_mpi <- function(dag, from_node, visited = c()){
+  if(from_node == "MPI") return(list(c(from_node)))
+  visited <- c(visited, from_node)
+  child_nodes <- children(dag, from_node)
+  if(length(child_nodes) == 0) return(list())
+  
+  all_paths <- list()
+  for(child in child_nodes){
+    if(child %in% visited) next
+    sub_paths <- find_paths_to_mpi(dag, child, visited)
+    for(sp in sub_paths){
+      all_paths <- c(all_paths, list(c(from_node, sp)))
+    }
+  }
+  return(all_paths)
+}
+
+# Direct parents of MPI
+direct_parents <- parents(primary_dag_disc_d, "MPI")
+
+# Classify each variable
+classification <- shift_summary %>%
+  mutate(
+    Has_Direct_Arc = Variable %in% direct_parents,
+    N_Paths = sapply(Variable, function(v){
+      length(find_paths_to_mpi(primary_dag_disc_d, v))
+    }),
+    Effect_Type = case_when(
+      Has_Direct_Arc          ~ "Direct",
+      !Has_Direct_Arc & N_Paths > 0 ~ "Indirect only",
+      TRUE                    ~ "No effect (no path)"
+    )
+  ) %>%
+  arrange(desc(abs(Shift_PHigh)))
+
+kable(
+  classification %>%
+    select(Variable, Effect_Type, N_Paths,
+           Shift_PHigh, Effect_Direction),
+  caption   = "Table 8: Direct vs Indirect Effect Classification",
+  col.names = c("Variable","Effect Type","Paths to MPI",
+                "Probability Shift","Direction")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = FALSE
+  ) %>%
+  row_spec(
+    which(classification$Effect_Type == "Direct"),
+    bold = TRUE, background = "#E1F5EE"
+  ) %>%
+  row_spec(
+    which(classification$Effect_Type == "No effect (no path)"),
+    background = "#FCEBEB"
+  )
+```
+
+```{r policy_scenarios, echo=FALSE}
+# Run policy-relevant counterfactual scenarios
+# Each scenario fixes multiple variables simultaneously
+# Reports the resulting P(MPI = state) distribution
+
+set.seed(42)
+
+scenarios <- list(
+  list(
+    label    = "Baseline (no evidence)",
+    evidence = "TRUE"
+  ),
+  list(
+    label    = "Worst case: high HHS, high RUR",
+    evidence = "(HHS == 'High') & (RUR == 'High')"
+  ),
+  list(
+    label    = "Best case: low HHS, low RUR",
+    evidence = "(HHS == 'Low') & (RUR == 'Low')"
+  ),
+  list(
+    label    = "Smaller households only (HHS=Low)",
+    evidence = "(HHS == 'Low')"
+  ),
+  list(
+    label    = "Urbanisation only (RUR=Low)",
+    evidence = "(RUR == 'Low')"
+  ),
+  list(
+    label    = "Both household + urban policy",
+    evidence = "(HHS == 'Low') & (RUR == 'Low')"
+  ),
+  list(
+    label    = "Education policy: high NJ alone",
+    evidence = "(NJ == 'High')"
+  ),
+  list(
+    label    = "Combined demographic-education",
+    evidence = "(HHS == 'Low') & (RUR == 'Low') & (NJ == 'High')"
+  )
+)
+
+scenario_results <- lapply(scenarios, function(s){
+  result <- query_mpi(bn_fit_weak, s$evidence, n_sim = 50000)
+  cbind(Scenario = s$label, result)
+})
+
+scenario_df <- bind_rows(scenario_results)
+
+scenario_df <- scenario_df %>%
+  mutate(
+    Most_Likely = apply(scenario_df[, c("P_Low","P_Medium","P_High")],
+                         1,
+                         function(x) c("Low","Medium","High")[which.max(x)])
+  )
+
+kable(
+  scenario_df,
+  caption   = "Table 9: Counterfactual MPI Distributions Under Policy Scenarios",
+  col.names = c("Scenario","P(MPI=Low)","P(MPI=Medium)",
+                "P(MPI=High)","Most Likely State")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = FALSE
+  ) %>%
+  row_spec(
+    which(scenario_df$Most_Likely == "Low"),
+    background = "#E1F5EE"
+  ) %>%
+  row_spec(
+    which(scenario_df$Most_Likely == "High"),
+    background = "#FCEBEB"
+  )
+```
+
+```{r scenario_sensitivity, echo=FALSE}
+# Verify scenarios are robust to prior choice
+# Compare weak vs strong prior for each scenario
+
+set.seed(42)
+
+scenario_results_strong <- lapply(scenarios, function(s){
+  result <- query_mpi(bn_fit_strong, s$evidence, n_sim = 50000)
+  cbind(Scenario = s$label, result)
+})
+
+scenario_strong_df <- bind_rows(scenario_results_strong)
+
+scenario_compare <- scenario_df %>%
+  select(Scenario, P_Low_Weak = P_Low,
+         P_Med_Weak = P_Medium, P_High_Weak = P_High) %>%
+  left_join(
+    scenario_strong_df %>%
+      select(Scenario, P_Low_Strong = P_Low,
+             P_Med_Strong = P_Medium, P_High_Strong = P_High),
+    by = "Scenario"
+  ) %>%
+  mutate(
+    MaxDiff = pmax(
+      abs(P_Low_Weak  - P_Low_Strong),
+      abs(P_Med_Weak  - P_Med_Strong),
+      abs(P_High_Weak - P_High_Strong)
+    ),
+    Verdict = ifelse(MaxDiff < 0.05, "Robust", "Sensitive")
+  )
+
+kable(
+  scenario_compare %>%
+    select(Scenario, P_High_Weak, P_High_Strong,
+           MaxDiff, Verdict),
+  caption   = "Table 10: Scenario Robustness — Weak vs Strong Prior",
+  col.names = c("Scenario","P(High|Weak)",
+                "P(High|Strong)","Max Diff","Verdict"),
+  digits    = 4
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = FALSE
+  ) %>%
+  row_spec(
+    which(scenario_compare$Verdict == "Robust"),
+    background = "#E1F5EE"
+  ) %>%
+  row_spec(
+    which(scenario_compare$Verdict == "Sensitive"),
+    background = "#FCEBEB"
+  )
+```
+
+```{r effect_plot, echo=FALSE, fig.width=10, fig.height=7}
+# Forest-plot-style visualisation of effect magnitudes
+# Variables ordered by absolute effect size
+
+plot_data <- shift_summary %>%
+  left_join(classification %>% select(Variable, Effect_Type),
+            by = "Variable") %>%
+  arrange(Shift_PHigh) %>%
+  mutate(
+    Variable    = factor(Variable, levels = Variable),
+    Color_Group = case_when(
+      Effect_Type == "Direct"          ~ "Direct effect",
+      Effect_Type == "Indirect only"   ~ "Indirect effect",
+      TRUE                              ~ "No effect"
+    )
+  )
+
+ggplot(plot_data,
+       aes(x = Shift_PHigh, y = Variable,
+           color = Color_Group)) +
+  geom_vline(xintercept = 0,
+             linetype = "dashed",
+             color = "gray60") +
+  geom_segment(aes(x = 0, xend = Shift_PHigh,
+                   y = Variable, yend = Variable),
+               linewidth = 0.5) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Direct effect"   = "#185FA5",
+                                  "Indirect effect" = "#1D9E75",
+                                  "No effect"       = "#B4B2A9")) +
+  labs(
+    title    = "Counterfactual Effects on P(MPI = High)",
+    subtitle = "Probability shift from Variable=Low to Variable=High",
+    x        = "Shift in P(MPI = High)",
+    y        = "Variable",
+    color    = "",
+    caption  = "Positive shift = increases poverty probability;
+                Negative shift = reduces poverty probability."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(color = "gray40", size = 10),
+    plot.caption  = element_text(color = "gray50", size = 8),
+    legend.position = "bottom"
+  )
+```
+
+```{r appendix_full_effects, echo=FALSE}
+# Appendix Table A1 — Full Direct vs Indirect Effect Classification
+# Self-contained: redefines all required objects locally
+# so it does not depend on Phase D4 objects being in session
+
+# All predictor variables (everything except MPI)
+non_target_vars_app <- setdiff(all_vars, "MPI")
+
+# Direct parents of MPI in the primary DAG
+direct_parents_app <- parents(primary_dag_disc_d, "MPI")
+
+# Reuse find_paths_to_mpi function defined in Phase D4
+# If session is fresh redefine it here
+find_paths_to_mpi <- function(dag, from_node, visited = c()){
+  if(from_node == "MPI") return(list(c(from_node)))
+  visited <- c(visited, from_node)
+  child_nodes <- children(dag, from_node)
+  if(length(child_nodes) == 0) return(list())
+  all_paths <- list()
+  for(child in child_nodes){
+    if(child %in% visited) next
+    sub_paths <- find_paths_to_mpi(dag, child, visited)
+    for(sp in sub_paths){
+      all_paths <- c(all_paths, list(c(from_node, sp)))
+    }
+  }
+  return(all_paths)
+}
+
+# Recompute single-variable probability shifts
+# so the appendix is self-contained
+set.seed(42)
+app_effects <- list()
+
+for(v in non_target_vars_app){
+  
+  n_paths <- length(find_paths_to_mpi(primary_dag_disc_d, v))
+  
+  ev_low  <- str2lang(sprintf("(%s == 'Low')",  v))
+  ev_high <- str2lang(sprintf("(%s == 'High')", v))
+  
+  p_low <- eval(bquote(
+    cpquery(bn_fit_weak,
+            event    = (MPI == "High"),
+            evidence = .(ev_low),
+            n        = 30000)
+  ))
+  
+  p_high <- eval(bquote(
+    cpquery(bn_fit_weak,
+            event    = (MPI == "High"),
+            evidence = .(ev_high),
+            n        = 30000)
+  ))
+  
+  app_effects[[v]] <- data.frame(
+    Variable    = v,
+    Effect_Type = case_when(
+      v %in% direct_parents_app ~ "Direct",
+      n_paths > 0               ~ "Indirect only",
+      TRUE                      ~ "No causal path"
+    ),
+    N_Paths     = n_paths,
+    P_High_Low  = round(p_low,         4),
+    P_High_High = round(p_high,        4),
+    Shift       = round(p_high - p_low, 4)
+  )
+}
+
+app_df <- bind_rows(app_effects) %>%
+  arrange(desc(abs(Shift)))
+
+kable(
+  app_df,
+  caption   = paste(
+    "Appendix Table A1: Full Counterfactual Effect Classification",
+    "— All 17 Predictors"
+  ),
+  col.names = c("Variable","Effect Type","Paths to MPI",
+                "P(High | Var=Low)","P(High | Var=High)",
+                "Probability Shift"),
+  digits    = 4
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed","bordered"),
+    font_size         = 12,
+    full_width        = FALSE
+  ) %>%
+  row_spec(
+    which(app_df$Effect_Type == "Direct"),
+    bold = TRUE, background = "#E1F5EE"
+  ) %>%
+  row_spec(
+    which(app_df$Effect_Type == "Indirect only"),
+    background = "#FAEEDA"
+  ) %>%
+  row_spec(
+    which(app_df$Effect_Type == "No causal path"),
+    background = "#FCEBEB"
+  ) %>%
+  footnote(
+    general = paste(
+      "Green = direct causal effect on MPI.",
+      "Yellow = indirect effect through intermediate nodes.",
+      "Red = no causal path to MPI;",
+      "probability shifts reflect confounded",
+      "statistical association, not causal influence."
+    ),
+    general_title = "Note:"
+  )
+```
+
+
+```{r load_shapefile, echo=FALSE}
+# Load the district boundary TopoJSON
+# sf can read TopoJSON if GDAL has the driver; if not, geojsonio handles it
+if(!requireNamespace("sf", quietly = TRUE)) install.packages("sf")
+if(!requireNamespace("geojsonio", quietly = TRUE)) install.packages("geojsonio")
+
+library(sf)
+library(geojsonio)
+
+shapefile_path <- "District_261.json"
+
+# Try sf first; fall back to geojsonio -> sf conversion if it fails
+ghana_sf <- tryCatch({
+  st_read(shapefile_path, quiet = TRUE)
+}, error = function(e) {
+  cat("sf::st_read failed on TopoJSON, converting via geojsonio...\n")
+  topo <- geojson_read(shapefile_path, what = "sp")
+  st_as_sf(topo)
+})
+
+cat("Shapefile loaded\n")
+cat("Number of polygons:", nrow(ghana_sf), "\n")
+cat("Columns available:", paste(names(ghana_sf), collapse = ", "), "\n")
+```
+
+
+
+```{r name_matching_diagnostic, echo=FALSE}
+# Compare district names between the data (Districtnames column)
+# and the shapefile (District column) to catch mismatches
+# before any map is built
+
+shapefile_names <- sort(ghana_sf$District)
+data_names      <- sort(df_raw$Districtnames)
+
+cat("Districts in shapefile:", length(shapefile_names), "\n")
+cat("Districts in data     :", length(data_names), "\n\n")
+
+# Exact matches
+exact_match <- intersect(shapefile_names, data_names)
+cat("Exact matches:", length(exact_match), "out of", nrow(df_raw), "\n\n")
+
+# Names in data but NOT in shapefile (need fixing)
+unmatched_data <- setdiff(data_names, shapefile_names)
+cat("=== Districts in DATA with no exact shapefile match (",
+    length(unmatched_data), ") ===\n")
+print(unmatched_data)
+
+cat("\n")
+
+# Names in shapefile but NOT in data
+unmatched_shapefile <- setdiff(shapefile_names, data_names)
+cat("=== Districts in SHAPEFILE with no exact data match (",
+    length(unmatched_shapefile), ") ===\n")
+print(unmatched_shapefile)
+
+# Simple fuzzy suggestion: for each unmatched data name, find the closest
+# shapefile name by string distance, to help manual reconciliation
+if(length(unmatched_data) > 0){
+  cat("\n=== Suggested closest shapefile match for each unmatched data name ===\n")
+  for(nm in unmatched_data){
+    dists <- adist(nm, shapefile_names)[1, ]
+    best  <- shapefile_names[which.min(dists)]
+    cat(sprintf("  DATA: '%s'  ->  CLOSEST SHAPEFILE: '%s' (distance = %d)\n",
+                nm, best, min(dists)))
+  }
+}
+```
+
+
+```{r name_reconciliation, echo=FALSE}
+# Manual reconciliation table
+# Two mismatches identified by the diagnostic chunk:
+# 1. Data has the correct "Cape Coast" but shapefile has a typo "Cape Cape"
+# 2. Data has a truncated "STM" but shapefile has the full "STMA"
+
+name_fixes <- data.frame(
+  data_name      = c(
+    "Cape Coast Metropolitan Area (CCMA)",
+    "Sekondi Takoradi Metropolitan Area (STM"
+  ),
+  shapefile_name = c(
+    "Cape Cape Metropolitan Area (CCMA)",
+    "Sekondi Takoradi Metropolitan Area (STMA)"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Apply fixes to a working copy of df_raw used only for mapping
+df_map <- df_raw
+
+for(i in seq_len(nrow(name_fixes))){
+  df_map$Districtnames[df_map$Districtnames == name_fixes$data_name[i]] <-
+    name_fixes$shapefile_name[i]
+}
+
+# Re-verify match rate after fixes
+post_fix_match <- sum(df_map$Districtnames %in% ghana_sf$District)
+cat("Districts matched after reconciliation:", post_fix_match,
+    "out of", nrow(df_map), "\n")
+
+if(post_fix_match < nrow(df_map)){
+  cat("\nStill unmatched:\n")
+  print(df_map$Districtnames[!df_map$Districtnames %in% ghana_sf$District])
+}
+```
+
+
+
+
+
+```{r service_count_maps_NO_LABEL, echo=FALSE, fig.width=12, fig.height=10}
+# Choropleth maps of raw counts for the four availability variables
+# NJ = junior high schools, NH = hospitals,
+# NP = police stations, NB = banks
+
+# Join the raw count data to the shapefile by district name
+map_data <- ghana_sf %>%
+  left_join(
+    df_map %>% select(Districtnames, Num_JHS, Num_Hosp,
+                       Num_Police, Num_Bank),
+    by = c("District" = "Districtnames")
+  )
+
+cat("Districts with joined data:",
+    sum(!is.na(map_data$Num_JHS)), "out of", nrow(map_data), "\n")
+
+# Reusable plotting function for one count variable
+plot_count_map <- function(data, var, title, fill_label){
+  ggplot(data) +
+    geom_sf(aes(fill = .data[[var]]), color = "white", linewidth = 0.1) +
+    scale_fill_gradientn(
+      colours = c("#FAEEDA", "#E1A95F", "#A6432F", "#5C1A1A"),
+      na.value = "grey85",
+      name = fill_label
+    ) +
+    labs(title = title) +
+    theme_void(base_size = 11) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 12, hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+p_nj <- plot_count_map(map_data, "Num_JHS",
+                        "Number of Junior High Schools", "Count")
+p_nh <- plot_count_map(map_data, "Num_Hosp",
+                        "Number of Hospitals", "Count")
+p_np <- plot_count_map(map_data, "Num_Police",
+                        "Number of Police Stations", "Count")
+p_nb <- plot_count_map(map_data, "Num_Bank",
+                        "Number of Banks", "Count")
+
+grid.arrange(p_nj, p_nh, p_np, p_nb, ncol = 2,
+             top = "Figure: District-Level Counts of Service Facilities (Availability Domain)")
+```
+
+
+```{r service_count_maps_LABELLED, echo=FALSE, fig.width=16, fig.height=14}
+# Choropleth maps of raw counts for the four availability variables
+# with district name labels at polygon centroids
+
+map_data <- ghana_sf %>%
+  left_join(
+    df_map %>% select(Districtnames, Num_JHS, Num_Hosp,
+                       Num_Police, Num_Bank),
+    by = c("District" = "Districtnames")
+  )
+
+cat("Districts with joined data:",
+    sum(!is.na(map_data$Num_JHS)), "out of", nrow(map_data), "\n")
+
+# Compute centroids once for label placement
+map_data$centroid <- st_centroid(map_data$geometry)
+map_data$lon <- st_coordinates(map_data$centroid)[, 1]
+map_data$lat <- st_coordinates(map_data$centroid)[, 2]
+
+# Shorten long district names for label readability
+# Strips common suffixes so labels do not overlap as badly
+map_data$label_short <- map_data$District %>%
+  gsub(" Municipal$", "", .) %>%
+  gsub(" Metropolitan.*$", "", .) %>%
+  gsub(" \\(.*\\)$", "", .)
+
+plot_count_map <- function(data, var, title, fill_label){
+  ggplot(data) +
+    geom_sf(aes(fill = .data[[var]]), color = "white", linewidth = 0.1) +
+    geom_text(
+      aes(x = lon, y = lat, label = label_short),
+      size = 1.4, color = "black", fontface = "plain",
+      check_overlap = TRUE
+    ) +
+    scale_fill_gradientn(
+      colours = c("#FAEEDA", "#E1A95F", "#A6432F", "#5C1A1A"),
+      na.value = "grey85",
+      name = fill_label
+    ) +
+    labs(title = title) +
+    theme_void(base_size = 11) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 12, hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+p_nj <- plot_count_map(map_data, "Num_JHS",
+                        "Number of Junior High Schools", "Count")
+p_nh <- plot_count_map(map_data, "Num_Hosp",
+                        "Number of Hospitals", "Count")
+p_np <- plot_count_map(map_data, "Num_Police",
+                        "Number of Police Stations", "Count")
+p_nb <- plot_count_map(map_data, "Num_Bank",
+                        "Number of Banks", "Count")
+
+grid.arrange(p_nj, p_nh, p_np, p_nb, ncol = 2,
+             top = "Figure: District-Level Counts of Service Facilities (Availability Domain)")
+```
+
+
+
+```{r district_reference_map, echo=FALSE, fig.width=14, fig.height=12}
+# Single reference map showing all 261 district names
+# Used once as a locator map; subsequent choropleths stay label-free
+
+map_data$centroid <- st_centroid(map_data$geometry)
+map_data$lon <- st_coordinates(map_data$centroid)[, 1]
+map_data$lat <- st_coordinates(map_data$centroid)[, 2]
+map_data$label_short <- map_data$District %>%
+  gsub(" Municipal$", "", .) %>%
+  gsub(" Metropolitan.*$", "", .) %>%
+  gsub(" \\(.*\\)$", "", .)
+
+ggplot(map_data) +
+  geom_sf(fill = "#F7F4ED", color = "grey50", linewidth = 0.15) +
+  geom_text(
+    aes(x = lon, y = lat, label = label_short),
+    size = 1.3, color = "black", check_overlap = TRUE
+  ) +
+  labs(title = "Figure: District Boundaries and Names (n = 261)") +
+  theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 13, hjust = 0.5))
+```
